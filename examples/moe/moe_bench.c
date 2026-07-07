@@ -4,7 +4,7 @@
  *
  * 每个样本在计时前生成随机 input，计时区间覆盖一次 vendor opcode 远程
  * 计算和一次 READ 取回 output 的完整 NVMe-oF 往返路径。统计策略参考 fio：
- * CLOCK_MONOTONIC、warmup/runtime 时间控制、min-calls 保底、对数分桶直方图。
+ * CLOCK_MONOTONIC、warmup/runtime 时间控制、对数分桶直方图。
  */
 
 #include "spdk/stdinc.h"
@@ -25,19 +25,15 @@
 
 #define DEFAULT_WARMUP_SEC 3
 #define DEFAULT_RUNTIME_SEC 10
-#define DEFAULT_MIN_CALLS 50
 #define DEFAULT_JSON_OUTPUT "./moe_bench_result.json"
 #define SPDK_BENCH_MEM_MB 512
 #define SPDK_DMA_ALIGN 0x1000
 
 struct bench_opts {
-	int d_model;
-	int d_ff;
 	int seed;
 	int cpu;
 	int warmup_sec;
 	int runtime_sec;
-	uint64_t min_calls;
 	const char *json_output;
 };
 
@@ -321,13 +317,10 @@ print_help(const char *prog)
 {
 	printf("用法: %s [选项]\n\n", prog);
 	printf("选项:\n");
-	printf("  --d_model=<int>       模型维度，必须等于当前 SPDK 宏 %d\n", MOE_D_MODEL);
-	printf("  --d_ff=<int>          FFN 中间维度，必须等于当前 SPDK 宏 %d\n", MOE_D_FF);
 	printf("  --seed=<int>          input 随机种子（默认: %d）\n", MOE_SEED_DEFAULT);
 	printf("  --cpu=<int>           绑定 CPU 核心（默认: 0）\n");
 	printf("  --warmup=<int>        预热秒数（默认: %d）\n", DEFAULT_WARMUP_SEC);
 	printf("  --runtime=<int>       正式测量秒数（默认: %d）\n", DEFAULT_RUNTIME_SEC);
-	printf("  --min-calls=<int>     每阶段保底调用次数（默认: %d）\n", DEFAULT_MIN_CALLS);
 	printf("  --json-output=<path>  JSON 输出路径（默认: %s）\n", DEFAULT_JSON_OUTPUT);
 	printf("  --help                打印帮助\n");
 }
@@ -356,41 +349,15 @@ parse_int_arg(const char *arg, const char *prefix, int *value)
 }
 
 static int
-parse_u64_arg(const char *arg, const char *prefix, uint64_t *value)
-{
-	size_t len = strlen(prefix);
-	char *end = NULL;
-	unsigned long long v;
-
-	if (strncmp(arg, prefix, len) != 0) {
-		return 0;
-	}
-	if (arg[len] == '\0') {
-		return -1;
-	}
-
-	v = strtoull(arg + len, &end, 10);
-	if (*end != '\0') {
-		return -1;
-	}
-
-	*value = v;
-	return 1;
-}
-
-static int
 parse_args(int argc, char **argv, struct bench_opts *opts)
 {
 	int i, r;
 
 	*opts = (struct bench_opts){
-		.d_model = MOE_D_MODEL,
-		.d_ff = MOE_D_FF,
 		.seed = MOE_SEED_DEFAULT,
 		.cpu = 0,
 		.warmup_sec = DEFAULT_WARMUP_SEC,
 		.runtime_sec = DEFAULT_RUNTIME_SEC,
-		.min_calls = DEFAULT_MIN_CALLS,
 		.json_output = DEFAULT_JSON_OUTPUT,
 	};
 
@@ -398,16 +365,6 @@ parse_args(int argc, char **argv, struct bench_opts *opts)
 		if (strcmp(argv[i], "--help") == 0) {
 			print_help(argv[0]);
 			exit(0);
-		}
-		r = parse_int_arg(argv[i], "--d_model=", &opts->d_model);
-		if (r != 0) {
-			if (r < 0) return -1;
-			continue;
-		}
-		r = parse_int_arg(argv[i], "--d_ff=", &opts->d_ff);
-		if (r != 0) {
-			if (r < 0) return -1;
-			continue;
 		}
 		r = parse_int_arg(argv[i], "--seed=", &opts->seed);
 		if (r != 0) {
@@ -429,11 +386,6 @@ parse_args(int argc, char **argv, struct bench_opts *opts)
 			if (r < 0) return -1;
 			continue;
 		}
-		r = parse_u64_arg(argv[i], "--min-calls=", &opts->min_calls);
-		if (r != 0) {
-			if (r < 0) return -1;
-			continue;
-		}
 		if (strncmp(argv[i], "--json-output=", strlen("--json-output=")) == 0) {
 			opts->json_output = argv[i] + strlen("--json-output=");
 			if (opts->json_output[0] == '\0') {
@@ -442,12 +394,6 @@ parse_args(int argc, char **argv, struct bench_opts *opts)
 			continue;
 		}
 		fprintf(stderr, "无法识别的参数: %s\n", argv[i]);
-		return -1;
-	}
-
-	if (opts->d_model != MOE_D_MODEL || opts->d_ff != MOE_D_FF) {
-		fprintf(stderr, "当前 SPDK MoE target 固定维度为 d_model=%d, d_ff=%d\n",
-			MOE_D_MODEL, MOE_D_FF);
 		return -1;
 	}
 
@@ -484,10 +430,9 @@ connect_target(struct spdk_nvme_qpair **qpair)
 
 static int
 run_phase(struct spdk_nvme_qpair *qpair, float *input, float *output,
-	  int seconds, uint64_t min_calls, struct latency_stats *stats, bool record,
-	  double *elapsed_sec)
+	  int seconds, struct latency_stats *stats, bool record, double *elapsed_sec)
 {
-	uint64_t start_ns, deadline_ns, end_ns, calls = 0;
+	uint64_t start_ns, deadline_ns, end_ns;
 	int rc;
 
 	start_ns = now_ns();
@@ -506,9 +451,7 @@ run_phase(struct spdk_nvme_qpair *qpair, float *input, float *output,
 		if (record) {
 			stats_record(stats, t1 - t0);
 		}
-		calls++;
-
-		if (calls >= min_calls && t1 >= deadline_ns) {
+		if (t1 >= deadline_ns) {
 			break;
 		}
 	}
@@ -544,8 +487,7 @@ write_json(const char *path, const struct bench_opts *opts,
 	fprintf(fp, "    \"seed\": %d,\n", opts->seed);
 	fprintf(fp, "    \"cpu\": %d,\n", opts->cpu);
 	fprintf(fp, "    \"warmup_sec\": %d,\n", opts->warmup_sec);
-	fprintf(fp, "    \"runtime_sec\": %d,\n", opts->runtime_sec);
-	fprintf(fp, "    \"min_calls\": %" PRIu64 "\n", opts->min_calls);
+	fprintf(fp, "    \"runtime_sec\": %d\n", opts->runtime_sec);
 	fprintf(fp, "  },\n");
 	fprintf(fp, "  \"latency_ns\": {\n");
 	fprintf(fp, "    \"min\": %" PRIu64 ",\n", stats->min_ns == UINT64_MAX ? 0 : stats->min_ns);
@@ -588,9 +530,9 @@ print_report(const struct bench_opts *opts, const struct latency_stats *stats,
 	printf("================================================================\n");
 	printf("  MoE FFN SPDK 性能评测报告\n");
 	printf("  d_model = %d, d_ff = %d, num_experts = %d, top_k = %d\n",
-	       opts->d_model, opts->d_ff, MOE_NUM_EXPERTS, MOE_TOP_K);
-	printf("  seed = %d, CPU: %d, warmup = %ds, runtime = %ds, min_calls = %" PRIu64 "\n",
-	       opts->seed, opts->cpu, opts->warmup_sec, opts->runtime_sec, opts->min_calls);
+	       MOE_D_MODEL, MOE_D_FF, MOE_NUM_EXPERTS, MOE_TOP_K);
+	printf("  seed = %d, CPU: %d, warmup = %ds, runtime = %ds\n",
+	       opts->seed, opts->cpu, opts->warmup_sec, opts->runtime_sec);
 	printf("  target: %s:%d, opcode = 0x%02x\n", MOE_TARGET_ADDR, MOE_TARGET_PORT, MOE_VENDOR_OPCODE);
 	printf("================================================================\n\n");
 
@@ -661,16 +603,14 @@ main(int argc, char **argv)
 	}
 
 	stats_reset(&stats);
-	rc = run_phase(qpair, input, output, opts.warmup_sec, opts.min_calls,
-		       &stats, false, &warmup_elapsed);
+	rc = run_phase(qpair, input, output, opts.warmup_sec, &stats, false, &warmup_elapsed);
 	if (rc != 0) {
 		fprintf(stderr, "warmup phase failed\n");
 		goto out;
 	}
 
 	stats_reset(&stats);
-	rc = run_phase(qpair, input, output, opts.runtime_sec, opts.min_calls,
-		       &stats, true, &runtime_elapsed);
+	rc = run_phase(qpair, input, output, opts.runtime_sec, &stats, true, &runtime_elapsed);
 	if (rc != 0) {
 		fprintf(stderr, "runtime phase failed\n");
 		goto out;
