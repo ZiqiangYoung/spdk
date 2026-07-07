@@ -143,10 +143,32 @@ io_complete(void *arg, const struct spdk_nvme_cpl *cpl)
 }
 
 static int
+process_admin_completions(void)
+{
+	int rc;
+
+	if (g_ctrlr == NULL) {
+		return 0;
+	}
+
+	rc = spdk_nvme_ctrlr_process_admin_completions(g_ctrlr);
+	return rc < 0 ? -EIO : 0;
+}
+
+static int
 wait_for_completion(struct spdk_nvme_qpair *qpair, struct moe_completion *completion)
 {
+	int rc;
+
 	while (!completion->done) {
-		spdk_nvme_qpair_process_completions(qpair, 0);
+		rc = spdk_nvme_qpair_process_completions(qpair, 0);
+		if (rc < 0) {
+			return -EIO;
+		}
+		rc = process_admin_completions();
+		if (rc != 0) {
+			return rc;
+		}
 	}
 
 	return completion->failed ? -EIO : 0;
